@@ -1,0 +1,8 @@
+# CPU-only torch — this box has no GPU, and the default (CUDA) build drags in
+# ~5GB of NVIDIA packages that fill the disk. Install torch FIRST, separately:
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+# then:  pip install -r requirements.txt
+transformers>=4.51        # Qwen3 support landed here
+datasets>=2.18
+tokenizers>=0.19
+accelerate>=0.30

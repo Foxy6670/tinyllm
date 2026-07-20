@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+
+# training artifacts - large, and small-scale checkpoints/corpora here may
+# have memorized real Telegram/session content; keep them out of a public repo
+checkpoints*/
+tokenizer/
+tokenizer-*/
+*.jsonl
+*.gguf
+*.safetensors
+llama.cpp/
