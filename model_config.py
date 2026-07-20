@@ -22,6 +22,8 @@ PRESETS = {
                   num_attention_heads=6, num_key_value_heads=2),   # ~20M
     "micro": dict(hidden_size=512, intermediate_size=1536, num_hidden_layers=12,
                   num_attention_heads=8, num_key_value_heads=2),   # ~48M
+    "large": dict(hidden_size=640, intermediate_size=1920, num_hidden_layers=14,
+                  num_attention_heads=10, num_key_value_heads=2),   # ~84M
 }
 
 
