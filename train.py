@@ -8,12 +8,18 @@ Document assembly (relabeling, UUID-stripping, dedup, scope) lives in data.py.
 """
 import argparse
 import os
+
+# Must be set before any tokenizer use: combining num_proc (below) with a fast
+# (Rust) tokenizer's own internal thread pool risks a fork/thread deadlock.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import queue
 import re
 import shutil
 import threading
 from itertools import chain
 
+import datasets
 import torch
 from datasets import Dataset
 from transformers import (
@@ -26,6 +32,12 @@ from transformers import (
 
 from data import SCOPES, iter_documents
 from model_config import BLOCK_SIZE, PRESETS, build_model
+
+# A live tqdm bar per map() call is fine on a terminal, but at num_proc>1 that's
+# one concurrently-redrawing bar per worker, streamed into a Colab output cell —
+# enough rendering churn to make the browser tab itself lock up. The stage-level
+# prints already in this script (doc/file counts, block counts) are enough signal.
+datasets.disable_progress_bars()
 
 
 class AsyncCheckpointSync(TrainerCallback):
@@ -134,7 +146,8 @@ def main():
     def tok_fn(batch):
         return tokenizer([t + eos for t in batch["text"]])
 
-    ds = ds.map(tok_fn, batched=True, remove_columns=ds.column_names)
+    n_proc = os.cpu_count() or 1
+    ds = ds.map(tok_fn, batched=True, remove_columns=ds.column_names, num_proc=n_proc)
 
     # 2) concatenate everything and chop into fixed-length blocks
     block = args.block_size
@@ -145,7 +158,7 @@ def main():
         chunks = [ids[i : i + block] for i in range(0, total, block)]
         return {"input_ids": chunks, "attention_mask": [[1] * block for _ in chunks]}
 
-    ds = ds.map(group, batched=True)
+    ds = ds.map(group, batched=True, num_proc=n_proc)
     if len(ds) == 0:
         raise SystemExit(
             f"Not enough text to fill a single {block}-token block. "
