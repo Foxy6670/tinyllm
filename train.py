@@ -119,10 +119,16 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     eos = tokenizer.eos_token
 
-    docs = list(iter_documents(args.data, args.scope))
-    if not docs:
+    # Stream straight into the Arrow table instead of materializing the whole
+    # corpus as a Python list first — at 19GB+ that list plus its Arrow copy
+    # existing simultaneously is what was blowing out RAM.
+    def _doc_gen():
+        for d in iter_documents(args.data, args.scope):
+            yield {"text": d}
+
+    ds = Dataset.from_generator(_doc_gen)
+    if len(ds) == 0:
         raise SystemExit(f"No documents found for scope={args.scope} in {args.data}")
-    ds = Dataset.from_dict({"text": docs})
 
     # 1) tokenize, appending EOS as a document separator
     def tok_fn(batch):
