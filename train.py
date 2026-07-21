@@ -93,7 +93,8 @@ def main():
         bf16=use_bf16,
         logging_steps=10,
         save_steps=500,
-        save_total_limit=2,
+        save_total_limit=1,  # Drive-mounted output has limited free space; only the
+                             # most recent checkpoint is needed to resume after a disconnect
         report_to="none",
     )
     trainer = Trainer(model=model, args=targs, train_dataset=ds, data_collator=collator)
