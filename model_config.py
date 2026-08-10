@@ -27,10 +27,11 @@ PRESETS = {
 }
 
 
-def build_config(vocab_size: int = VOCAB_SIZE, size: str = DEFAULT_SIZE) -> Qwen3Config:
+def build_config(vocab_size: int = VOCAB_SIZE, size: str = DEFAULT_SIZE,
+                  block_size: int = BLOCK_SIZE) -> Qwen3Config:
     return Qwen3Config(
         vocab_size=vocab_size,
-        max_position_embeddings=BLOCK_SIZE,
+        max_position_embeddings=block_size,
         tie_word_embeddings=True,      # critical at this scale
         rope_theta=10000.0,
         # one token does triple duty: bos / eos / pad (id 0 from the tokenizer)
@@ -41,9 +42,10 @@ def build_config(vocab_size: int = VOCAB_SIZE, size: str = DEFAULT_SIZE) -> Qwen
     )
 
 
-def build_model(vocab_size: int = VOCAB_SIZE, size: str = DEFAULT_SIZE) -> Qwen3ForCausalLM:
+def build_model(vocab_size: int = VOCAB_SIZE, size: str = DEFAULT_SIZE,
+                 block_size: int = BLOCK_SIZE) -> Qwen3ForCausalLM:
     """Cold-init the model. This is real pretraining — no weights are loaded."""
-    return Qwen3ForCausalLM(build_config(vocab_size, size))
+    return Qwen3ForCausalLM(build_config(vocab_size, size, block_size))
 
 
 if __name__ == "__main__":

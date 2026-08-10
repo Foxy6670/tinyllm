@@ -41,19 +41,26 @@ datasets.disable_progress_bars()
 
 
 class AsyncCheckpointSync(TrainerCallback):
-    """Mirrors each local checkpoint to a (typically Drive-mounted, slow) directory
-    on a background thread, so a slow write only ever competes for CPU/bandwidth —
-    it never pauses training the way saving straight to that directory would.
+    """Mirrors each local checkpoint to a (typically Drive-mounted, slow, or just
+    roomier) directory on a background thread, so a slow write only ever competes
+    for CPU/bandwidth - it never pauses training the way saving straight to that
+    directory would.
 
     Trainer's own save_total_limit is disabled locally when this is active (see
     main()); a local checkpoint is only deleted after its copy is confirmed on
     sync_dir, so a lagging upload can never lose a checkpoint to local rotation.
-    Retention (`keep`) is enforced on the sync_dir side instead.
+
+    Retention on the sync_dir side: the most recent `keep_recent` checkpoints
+    stay (quick-resume window), PLUS every `keep_every`-th save (by save index,
+    i.e. step // save_steps) is kept permanently as a historical artifact -
+    never pruned, regardless of age.
     """
 
-    def __init__(self, sync_dir: str, keep: int):
+    def __init__(self, sync_dir: str, keep_recent: int, keep_every: int, save_steps: int):
         self.sync_dir = sync_dir
-        self.keep = keep
+        self.keep_recent = keep_recent
+        self.keep_every = keep_every
+        self.save_steps = save_steps
         os.makedirs(sync_dir, exist_ok=True)
         self._q = queue.Queue()
         self._worker = threading.Thread(target=self._run, daemon=True)
@@ -89,8 +96,13 @@ class AsyncCheckpointSync(TrainerCallback):
             for n in os.listdir(self.sync_dir)
             if (m := re.fullmatch(r"checkpoint-(\d+)", n))
         )
-        for _, n in ckpts[:-self.keep]:
-            shutil.rmtree(os.path.join(self.sync_dir, n), ignore_errors=True)
+        keep_names = {n for _, n in ckpts[-self.keep_recent:]}       # quick-resume window
+        if self.keep_every:
+            keep_names |= {n for step, n in ckpts                    # historical artifacts
+                           if (step // self.save_steps) % self.keep_every == 0}
+        for _, n in ckpts:
+            if n not in keep_names:
+                shutil.rmtree(os.path.join(self.sync_dir, n), ignore_errors=True)
 
     def on_save(self, args, state, control, **kwargs):
         local_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
@@ -119,11 +131,30 @@ def main():
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--grad-accum", type=int, default=4)
     ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--save-total-limit", type=int, default=1)
+    ap.add_argument("--save-steps", type=int, default=500)
+    ap.add_argument("--keep-recent", type=int, default=1,
+                     help="quick-resume window: most recent N checkpoints always kept")
+    ap.add_argument("--keep-every", type=int, default=0,
+                     help="also keep every Nth save (by save index) permanently as a "
+                          "historical artifact, on top of --keep-recent. 0 = disabled. "
+                          "Only enforced on --sync-out (local --out is transient scratch "
+                          "when --sync-out is active - see AsyncCheckpointSync)")
     ap.add_argument("--sync-out", default=None,
                      help="mirror checkpoints here on a background thread (e.g. a "
-                          "Drive-mounted dir); --out becomes a fast local scratch dir "
-                          "and --save-total-limit is enforced on --sync-out instead")
+                          "Drive-mounted dir, or just a roomier disk); --out becomes a "
+                          "fast local scratch dir and retention is enforced on --sync-out")
+    ap.add_argument("--resume", action="store_true",
+                     help="resume from the latest checkpoint - in --sync-out if set, "
+                          "else --out. Without this flag, training always starts fresh "
+                          "even if old checkpoints are sitting in --out/--sync-out.")
+    ap.add_argument("--grad-checkpoint", action="store_true",
+                     help="trade ~20-30% more compute time for much lower activation "
+                          "VRAM, by recomputing activations in backward instead of "
+                          "storing them. Use when VRAM, not compute, is the wall.")
+    ap.add_argument("--8bit-adam", action="store_true", dest="adam8bit",
+                     help="quantize AdamW's momentum buffers to 8-bit (bitsandbytes) "
+                          "to cut optimizer-state VRAM well below the fp32 default. "
+                          "Master weights/grads stay full precision.")
     args = ap.parse_args()
 
     torch.set_num_threads(os.cpu_count() or 1)   # use all logical cores (SMT helps here)
@@ -138,16 +169,47 @@ def main():
         for d in iter_documents(args.data, args.scope):
             yield {"text": d}
 
+    # datasets caches EACH pipeline stage as a separate on-disk Arrow file. At
+    # multi-GB corpus scale, all three stages (raw text / tokenized / grouped)
+    # coexisting can approach 3x the corpus size. cleanup_stale_cache() below
+    # removes a finished stage's file(s) once the next stage no longer needs
+    # them, keeping peak disk usage to roughly one stage at a time.
+    def cache_files(dataset):
+        return {f["filename"] for f in dataset.cache_files}
+
+    def cleanup_stale_cache(old_files, new_files):
+        # Only remove files the CURRENT dataset doesn't reference - e.g. shuffle()
+        # often just wraps an indices mapping around the same underlying file
+        # rather than copying it, so "previous stage" isn't always safe to delete
+        # outright; the set difference is what's actually been superseded.
+        for f in old_files - new_files:
+            if os.path.exists(f):
+                os.remove(f)
+
     ds = Dataset.from_generator(_doc_gen)
     if len(ds) == 0:
         raise SystemExit(f"No documents found for scope={args.scope} in {args.data}")
+
+    # Shuffle before sharding across num_proc workers. map(num_proc=N) splits the
+    # dataset into N CONTIGUOUS index ranges, not random samples - a corpus built
+    # by concatenating sources in sequence (e.g. all ~20K-token OpenThoughts3-style
+    # docs together, then short FineWeb-Edu paragraphs) can leave one worker's
+    # batches full of huge documents while another's are all tiny, blowing that
+    # worker's RAM far past the others. Confirmed: this took the TUF down (100%
+    # RAM + swap thrashing) on the first attempt at this corpus - don't remove.
+    ds = ds.shuffle(seed=42)
+    stage_files = cache_files(ds)
 
     # 1) tokenize, appending EOS as a document separator
     def tok_fn(batch):
         return tokenizer([t + eos for t in batch["text"]])
 
     n_proc = os.cpu_count() or 1
-    ds = ds.map(tok_fn, batched=True, remove_columns=ds.column_names, num_proc=n_proc)
+    # Small batch_size caps peak memory per worker regardless of doc length mix -
+    # defense in depth alongside the shuffle above, not a substitute for it.
+    ds = ds.map(tok_fn, batched=True, batch_size=64, remove_columns=ds.column_names, num_proc=n_proc)
+    cleanup_stale_cache(stage_files, cache_files(ds))
+    stage_files = cache_files(ds)
 
     # 2) concatenate everything and chop into fixed-length blocks
     block = args.block_size
@@ -158,22 +220,25 @@ def main():
         chunks = [ids[i : i + block] for i in range(0, total, block)]
         return {"input_ids": chunks, "attention_mask": [[1] * block for _ in chunks]}
 
-    ds = ds.map(group, batched=True, num_proc=n_proc)
+    ds = ds.map(group, batched=True, batch_size=256, num_proc=n_proc)
     if len(ds) == 0:
         raise SystemExit(
             f"Not enough text to fill a single {block}-token block. "
             "Add more data or lower --block-size."
         )
+    cleanup_stale_cache(stage_files, cache_files(ds))
     print(f"{len(ds)} blocks x {block} tokens  (~{len(ds) * block / 1e6:.2f}M tokens)")
 
-    model = build_model(vocab_size=tokenizer.vocab_size, size=args.size)
+    model = build_model(vocab_size=tokenizer.vocab_size, size=args.size, block_size=args.block_size)
     print(f"Model: {model.num_parameters() / 1e6:.1f}M params")
 
-    # If resuming and a checkpoint already made it to --sync-out (e.g. after a
-    # disconnect wiped the local scratch disk), pull the latest one back down
-    # before training starts so we can hand it to Trainer as resume_from_checkpoint.
+    # --resume gates this explicitly: without it, training always starts fresh,
+    # even if --out/--sync-out already has checkpoints sitting in it (e.g. from
+    # a previous unrelated run reusing the same paths).
     resume_from = None
-    if args.sync_out:
+    if args.resume and args.sync_out:
+        # local scratch disk may have been wiped between sessions - pull the
+        # latest checkpoint back down from sync_out before handing it to Trainer.
         os.makedirs(args.sync_out, exist_ok=True)
         existing = sorted(
             (int(m.group(1)), n)
@@ -183,8 +248,12 @@ def main():
         if existing:
             _, name = existing[-1]
             resume_from = os.path.join(args.out, name)
-            print(f"[async-sync] resuming from {name} found on {args.sync_out}")
+            print(f"[resume] found {name} on --sync-out, copying to local scratch...")
             shutil.copytree(os.path.join(args.sync_out, name), resume_from, dirs_exist_ok=True)
+        else:
+            print("[resume] --resume given but no checkpoint found on --sync-out; starting fresh")
+    elif args.resume:
+        resume_from = True   # Trainer auto-detects the latest checkpoint in --out
 
     use_bf16 = torch.cuda.is_available()
     collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
@@ -200,19 +269,22 @@ def main():
         weight_decay=0.1,
         adam_beta2=0.95,            # the standard LLM-pretraining beta2
         bf16=use_bf16,
+        gradient_checkpointing=args.grad_checkpoint,
+        optim="adamw_bnb_8bit" if args.adam8bit else "adamw_torch",
         logging_steps=10,
-        save_steps=500,
+        save_steps=args.save_steps,
         # When syncing async, local rotation is disabled (AsyncCheckpointSync deletes
         # a local checkpoint only once it's confirmed on sync_out, and enforces
-        # save_total_limit there instead) so a slow upload can never race a local delete.
-        save_total_limit=None if args.sync_out else args.save_total_limit,
+        # retention there instead) so a slow upload can never race a local delete.
+        save_total_limit=None if args.sync_out else args.keep_recent,
         report_to="none",
     )
 
     sync_cb = None
     callbacks = []
     if args.sync_out:
-        sync_cb = AsyncCheckpointSync(args.sync_out, keep=args.save_total_limit)
+        sync_cb = AsyncCheckpointSync(args.sync_out, keep_recent=args.keep_recent,
+                                       keep_every=args.keep_every, save_steps=args.save_steps)
         callbacks.append(sync_cb)
 
     trainer = Trainer(model=model, args=targs, train_dataset=ds, data_collator=collator,

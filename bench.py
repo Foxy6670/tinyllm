@@ -20,7 +20,12 @@ from model_config import BLOCK_SIZE, PRESETS, build_model
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--size", default="nano", choices=list(PRESETS))
-    ap.add_argument("--vocab-size", type=int, default=8000)
+    ap.add_argument("--vocab-size", type=int, default=8000,
+                     help="MUST match the real tokenizer's vocab_size for accurate VRAM "
+                          "numbers - the lm_head logits/loss activation scales with "
+                          "block_size * vocab_size and isn't shrunk by --grad-checkpoint. "
+                          "This placeholder default silently underestimated VRAM for the "
+                          "'large' 32768-vocab run and caused a real mid-run OOM.")
     ap.add_argument("--block-size", type=int, default=BLOCK_SIZE)
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--steps", type=int, default=20)
@@ -28,6 +33,10 @@ def main():
     ap.add_argument("--amp", action="store_true",
                      help="autocast bf16 for forward/backward (engages tensor cores on Ampere+); "
                           "master weights and optimizer state stay fp32, no loss-scaler needed")
+    ap.add_argument("--grad-checkpoint", action="store_true",
+                     help="trade ~20-30% more compute time for much lower activation VRAM")
+    ap.add_argument("--8bit-adam", action="store_true", dest="adam8bit",
+                     help="quantize AdamW's momentum buffers to 8-bit (bitsandbytes)")
     args = ap.parse_args()
 
     if args.threads:
@@ -37,10 +46,17 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
-    model = build_model(vocab_size=args.vocab_size, size=args.size).to(device)
+    model = build_model(vocab_size=args.vocab_size, size=args.size, block_size=args.block_size).to(device)
+    if args.grad_checkpoint:
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.train()
     params_m = model.num_parameters() / 1e6
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    if args.adam8bit:
+        import bitsandbytes as bnb
+        opt = bnb.optim.AdamW8bit(model.parameters(), lr=3e-4)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
     B, T = args.batch_size, args.block_size
     ids = torch.randint(0, args.vocab_size, (B, T), device=device)
