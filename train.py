@@ -186,6 +186,15 @@ def main():
             if os.path.exists(f):
                 os.remove(f)
 
+    # datasets caches Dataset.from_generator()'s output by fingerprint and can try
+    # to reuse a cache entry from a previous, unrelated launch (e.g. --resume after
+    # a kill/restart). But cleanup_stale_cache() below deletes each stage's cache
+    # as soon as the next stage supersedes it, so a cross-launch cache is never
+    # safely reusable - it's either already gone or a stale reference to files
+    # that cleanup already deleted, which crashes with FileNotFoundError instead
+    # of regenerating. Starting every launch with a clean cache dir avoids that.
+    shutil.rmtree(datasets.config.HF_DATASETS_CACHE, ignore_errors=True)
+
     ds = Dataset.from_generator(_doc_gen)
     if len(ds) == 0:
         raise SystemExit(f"No documents found for scope={args.scope} in {args.data}")
@@ -229,7 +238,10 @@ def main():
     cleanup_stale_cache(stage_files, cache_files(ds))
     print(f"{len(ds)} blocks x {block} tokens  (~{len(ds) * block / 1e6:.2f}M tokens)")
 
-    model = build_model(vocab_size=tokenizer.vocab_size, size=args.size, block_size=args.block_size)
+    # tokenizer.vocab_size only reflects the base BPE model's own size and silently
+    # excludes any tokens appended via add_special_tokens() beyond that range - use
+    # len(tokenizer) so the model's embedding table always matches the real id space.
+    model = build_model(vocab_size=len(tokenizer), size=args.size, block_size=args.block_size)
     print(f"Model: {model.num_parameters() / 1e6:.1f}M params")
 
     # --resume gates this explicitly: without it, training always starts fresh,
