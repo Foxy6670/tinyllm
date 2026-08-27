@@ -37,6 +37,19 @@ BOONIE = "<|boonie|>"
 CODE = "<|code|>"
 SPECIAL_TOKENS = [EOS, ID, SYS, ENV, FOXO, BOONIE, CODE]
 
+# General reasoning-corpus scheme (build_reasoning_corpus.py's actual tag set -
+# nvidia/Nemotron-Agentic-v1, OpenThoughts3, FineWeb-Edu, SODA). Kept separate
+# from SPECIAL_TOKENS above: this is the general pretraining base, and its
+# tags were deliberately chosen distinct from Boonie's voice-scheme tags
+# (ENV/FOXO/BOONIE/CODE) so the two never collide when Boonie's voice is
+# fine-tuned on top later - see boonie-finetune-goals memory.
+USER = "<|user|>"
+ASSISTANT = "<|assistant|>"
+TOOL = "<|tool|>"
+THINK_OPEN = "<think>"
+THINK_CLOSE = "</think>"
+REASONING_SPECIAL_TOKENS = [EOS, ID, SYS, USER, ASSISTANT, TOOL, THINK_OPEN, THINK_CLOSE]
+
 SCOPES = ("voice", "full", "assistant")
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
