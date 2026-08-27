@@ -10,6 +10,12 @@ picked these sources and ratios):
     much smaller, later fine-tune stage - see boonie-finetune-goals memory)
   - HuggingFaceFW/fineweb-edu sample-10BT  (general web text, sliced, so the
     model isn't purely STEM/agentic-brained)
+  - allenai/soda  (~1.5M synthetic social/commonsense dialogues, no task or
+    tool framing at all - added after the first pretraining run showed the
+    model had NEVER seen a <|user|> turn that wasn't a task/tool request:
+    every dialogue-tagged doc in Nemotron+OpenThoughts is inherently
+    task-driven, and FineWeb-Edu has no dialogue structure. SODA is the fix -
+    it teaches "casual remark -> casual reply, no tool needed.")
 
 New tags distinct from Boonie's (<|boonie|>/<|foxo|>/<|env|>) so this general
 base and Boonie's specific voice never collide when we later fine-tune on top:
@@ -23,9 +29,9 @@ Streams everything (no full-dataset download) and stops each source once its
 OWN measured token budget (via the tokenizer you pass in) is hit - budgets are
 targets, not exact, since real per-row length varies.
 
-    python build_reasoning_corpus.py --tokenizer tokenizer-codemix \
+    python build_reasoning_corpus.py --tokenizer tokenizer-redo-16384 \
         --out corpus_reasoning.jsonl \
-        --openthoughts-tokens 1.81e9 --fineweb-tokens 0.78e9
+        --openthoughts-tokens 1.81e9 --fineweb-tokens 0.78e9 --soda-tokens 0.9e9
 """
 import argparse
 import itertools
@@ -101,6 +107,28 @@ def render_fineweb(row):
     return clean(row["text"]).strip()
 
 
+def render_soda(row):
+    """SODA's dialogues are plain social exchanges between two named people
+    (e.g. Veda/Priest) with no user/assistant framing of their own - we impose
+    an alternating <|user|>/<|assistant|> structure onto it (first speaker ->
+    user, second -> assistant, ...) purely so it uses the same tag vocabulary
+    as the rest of the corpus. The "assistant" side here is just a generic
+    conversational partner, not a helpful-AI persona - that's the point: it's
+    the only source teaching that <|assistant|> can be a plain casual reply
+    with no tool call or task decomposition."""
+    dialogue = row.get("dialogue") or []
+    if len(dialogue) < 2:
+        return None
+    parts = []
+    narrative = row.get("narrative")
+    if narrative:
+        parts.append(SYS + clean(narrative).strip())
+    for i, turn in enumerate(dialogue):
+        tag = USER if i % 2 == 0 else ASSISTANT
+        parts.append(tag + clean(turn).strip())
+    return "\n".join(parts)
+
+
 def iter_raw_jsonl(repo_id, filename):
     """Download+iterate a dataset's raw .jsonl file as plain JSON lines, bypassing
     datasets' pyarrow streaming - Nemotron's per-tool JSON-schema fields vary in
@@ -152,17 +180,21 @@ def main():
                           "training tokenizer should be retrained on a sample of the "
                           "output, which may shift real counts slightly")
     ap.add_argument("--out", default="corpus_reasoning.jsonl")
-    ap.add_argument("--only", choices=["nemotron", "openthoughts", "fineweb"], default=None,
-                     help="run just one source (for running the 3 sources as separate "
+    ap.add_argument("--only", choices=["nemotron", "openthoughts", "fineweb", "soda"], default=None,
+                     help="run just one source (for running the sources as separate "
                           "concurrent processes - they're independent, CPU-bound work, "
                           "and don't share any state)")
     ap.add_argument("--nemotron-tokens", type=float, default=None,
                      help="cap for testing; real run wants None (use all of it)")
     ap.add_argument("--openthoughts-tokens", type=float, default=1.81e9)
     ap.add_argument("--fineweb-tokens", type=float, default=0.78e9)
+    ap.add_argument("--soda-tokens", type=float, default=0.9e9,
+                     help="comparable scale to the fineweb slice, so the "
+                          "casual-dialogue signal isn't drowned out")
     ap.add_argument("--openthoughts-skip", type=int, default=0,
                      help="rows an earlier pull already consumed - resume past them")
     ap.add_argument("--fineweb-skip", type=int, default=0)
+    ap.add_argument("--soda-skip", type=int, default=0)
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer)
@@ -192,6 +224,14 @@ def main():
                 "fineweb-edu", tok, out, render_fineweb,
                 token_budget=args.fineweb_tokens, skip_rows=args.fineweb_skip,
                 path="HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train",
+            )
+
+        if args.only in (None, "soda"):
+            print(f"\n=== SODA (capped at {args.soda_tokens/1e9:.2f}B tokens) ===")
+            grand_total += stream_budget(
+                "soda", tok, out, render_soda,
+                token_budget=args.soda_tokens, skip_rows=args.soda_skip,
+                path="allenai/soda", split="train",
             )
 
     print(f"\nGRAND TOTAL: ~{grand_total/1e9:.2f}B tokens (measured with {args.tokenizer}) -> {args.out}")
