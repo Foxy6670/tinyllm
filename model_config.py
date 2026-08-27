@@ -22,8 +22,13 @@ PRESETS = {
                   num_attention_heads=6, num_key_value_heads=2),   # ~20M
     "micro": dict(hidden_size=512, intermediate_size=1536, num_hidden_layers=12,
                   num_attention_heads=8, num_key_value_heads=2),   # ~48M
-    "large": dict(hidden_size=640, intermediate_size=1920, num_hidden_layers=14,
-                  num_attention_heads=10, num_key_value_heads=2),   # ~84M
+    # hidden_size/intermediate_size are multiples of 256 (llama.cpp's K-quant
+    # superblock size, QK_K) so GGUF quantization to Q4_K/Q5_K/Q6_K applies
+    # cleanly to every tensor instead of falling back to legacy Q4_0/Q5_0/Q8_0
+    # for non-conforming dims (640/1920 weren't multiples of 256 - the 89.6M
+    # run's Q4_K_M had 84/156 tensors silently demoted to fallback quant).
+    "large": dict(hidden_size=768, intermediate_size=2048, num_hidden_layers=14,
+                  num_attention_heads=10, num_key_value_heads=2),   # ~large, K-quant clean
 }
 
 

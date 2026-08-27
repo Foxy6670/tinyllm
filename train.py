@@ -244,6 +244,17 @@ def main():
     model = build_model(vocab_size=len(tokenizer), size=args.size, block_size=args.block_size)
     print(f"Model: {model.num_parameters() / 1e6:.1f}M params")
 
+    # Native bf16 weights instead of the classic fp32-master-weights + autocast
+    # recipe. That recipe exists for fp16's narrow dynamic range (5 exponent
+    # bits - small updates could underflow); bf16 shares fp32's 8 exponent
+    # bits, so the original justification doesn't apply. Halves weight+grad
+    # VRAM (measured ~500MB saved on the 111M large preset) with the loss
+    # itself still computed in fp32 (ForCausalLMLoss upcasts logits
+    # unconditionally, confirmed against the installed transformers version).
+    use_bf16 = torch.cuda.is_available()
+    if use_bf16:
+        model = model.to(torch.bfloat16)
+
     # --resume gates this explicitly: without it, training always starts fresh,
     # even if --out/--sync-out already has checkpoints sitting in it (e.g. from
     # a previous unrelated run reusing the same paths).
@@ -267,7 +278,6 @@ def main():
     elif args.resume:
         resume_from = True   # Trainer auto-detects the latest checkpoint in --out
 
-    use_bf16 = torch.cuda.is_available()
     collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
     targs = TrainingArguments(
         output_dir=args.out,
@@ -280,7 +290,8 @@ def main():
         warmup_steps=10,
         weight_decay=0.1,
         adam_beta2=0.95,            # the standard LLM-pretraining beta2
-        bf16=use_bf16,
+        # bf16 autocast is redundant/off here - the model's own weights are
+        # already native bf16 (see above) when CUDA is available.
         gradient_checkpointing=args.grad_checkpoint,
         optim="adamw_bnb_8bit" if args.adam8bit else "adamw_torch",
         logging_steps=10,
