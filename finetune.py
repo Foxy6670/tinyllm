@@ -68,7 +68,15 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
     eos = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(args.checkpoint)  # NOT a cold init
-    print(f"Loaded {model.num_parameters() / 1e6:.1f}M-param checkpoint from {args.checkpoint}")
+    # v0's checkpoint predates the bf16-native switch (see train.py), so it loads
+    # as fp32 unless cast explicitly. No compute speedup on this CPU (no bf16
+    # hardware acceleration), but halves weight+activation memory - directly
+    # relevant here since Gateway's swap cycling tracks the forward/backward
+    # peak, not a slow leak. adamw_torch's momentum buffers inherit the param
+    # dtype, so this does put Adam's variance accumulator in bf16 too - a real
+    # but modest risk over this short a fine-tune (~1.6K steps, not a pretrain).
+    model = model.to(torch.bfloat16)
+    print(f"Loaded {model.num_parameters() / 1e6:.1f}M-param checkpoint from {args.checkpoint} (bf16)")
 
     def _doc_gen():
         for d in iter_documents(args.data, "voice"):
