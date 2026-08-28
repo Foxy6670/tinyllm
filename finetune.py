@@ -43,6 +43,8 @@ def main():
                           "short-dialogue-shaped fine-tune benefits from not force-packing "
                           "unrelated conversations into one 8192-token block")
     ap.add_argument("--epochs", type=float, default=1.0)
+    ap.add_argument("--max-steps", type=int, default=-1,
+                     help=">0 overrides --epochs; for quick throughput probes")
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--grad-accum", type=int, default=8)
     ap.add_argument("--lr", type=float, default=5e-5,
@@ -92,6 +94,7 @@ def main():
     targs = TrainingArguments(
         output_dir=args.out,
         num_train_epochs=args.epochs,
+        max_steps=args.max_steps,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
