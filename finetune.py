@@ -52,6 +52,10 @@ def main():
                           "continuing an already-trained model, not cold-initing one")
     ap.add_argument("--save-steps", type=int, default=200)
     ap.add_argument("--keep-recent", type=int, default=3)
+    ap.add_argument("--resume", action="store_true",
+                     help="resume from the latest checkpoint in --out - Trainer "
+                          "auto-detects it. Without this flag, always starts fresh "
+                          "from --checkpoint even if --out has checkpoints in it.")
     ap.add_argument("--num-proc", type=int, default=0,
                      help="dataset .map() worker count; 0 = auto-scale to dataset "
                           "size instead of always maxing out cores (see comment "
@@ -121,7 +125,7 @@ def main():
         report_to="none",
     )
     trainer = Trainer(model=model, args=targs, train_dataset=ds, data_collator=collator)
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume)
 
     trainer.save_model(args.out)
     tokenizer.save_pretrained(args.out)
