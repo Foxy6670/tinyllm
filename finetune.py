@@ -52,6 +52,11 @@ def main():
                           "continuing an already-trained model, not cold-initing one")
     ap.add_argument("--save-steps", type=int, default=200)
     ap.add_argument("--keep-recent", type=int, default=3)
+    ap.add_argument("--num-proc", type=int, default=0,
+                     help="dataset .map() worker count; 0 = auto-scale to dataset "
+                          "size instead of always maxing out cores (see comment "
+                          "at call site - oversubscribing this on a small sample "
+                          "is what caused the Gateway swap-thrashing incident)")
     args = ap.parse_args()
 
     torch.set_num_threads(os.cpu_count() or 1)
@@ -74,7 +79,14 @@ def main():
     def tok_fn(batch):
         return tokenizer([t + eos for t in batch["text"]])
 
-    n_proc = os.cpu_count() or 1
+    # Each worker forks a full python+torch+transformers process (~300-500MB
+    # baseline RSS just from imports) - on an 8-thread/6.7GB box, cpu_count()
+    # workers for a tiny sample is pure overhead, and stacking multiple such
+    # pools across sequential test runs is what pushed Gateway into swap
+    # thrashing badly enough to become SSH-unresponsive. Scale workers to
+    # actual dataset size instead of always maxing out cores.
+    n_proc = args.num_proc if args.num_proc > 0 else min(os.cpu_count() or 1, max(1, len(ds) // 500))
+    print(f"[finetune] using num_proc={n_proc} for {len(ds)} docs")
     ds = ds.map(tok_fn, batched=True, batch_size=64, remove_columns=ds.column_names, num_proc=n_proc)
 
     block = args.block_size
