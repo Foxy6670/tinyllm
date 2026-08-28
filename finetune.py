@@ -51,6 +51,11 @@ def main():
                      help="fine-tune LR, well below the 3e-4 pretrain peak - this is "
                           "continuing an already-trained model, not cold-initing one")
     ap.add_argument("--save-steps", type=int, default=200)
+    ap.add_argument("--logging-steps", type=int, default=2,
+                     help="logging_steps counts OPTIMIZER steps, not micro-batches - "
+                          "at grad-accum=8 the default of 10 meant an 80-microbatch "
+                          "wait (45+ min here) before the first visible loss line. "
+                          "Kept low by default so progress stays observable.")
     ap.add_argument("--keep-recent", type=int, default=3)
     ap.add_argument("--resume", action="store_true",
                      help="resume from the latest checkpoint in --out - Trainer "
@@ -68,15 +73,14 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
     eos = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(args.checkpoint)  # NOT a cold init
-    # v0's checkpoint predates the bf16-native switch (see train.py), so it loads
-    # as fp32 unless cast explicitly. No compute speedup on this CPU (no bf16
-    # hardware acceleration), but halves weight+activation memory - directly
-    # relevant here since Gateway's swap cycling tracks the forward/backward
-    # peak, not a slow leak. adamw_torch's momentum buffers inherit the param
-    # dtype, so this does put Adam's variance accumulator in bf16 too - a real
-    # but modest risk over this short a fine-tune (~1.6K steps, not a pretrain).
-    model = model.to(torch.bfloat16)
-    print(f"Loaded {model.num_parameters() / 1e6:.1f}M-param checkpoint from {args.checkpoint} (bf16)")
+    # Tried casting to bf16 here for the memory savings (halves weight+activation
+    # footprint) - measured on Gateway (Ryzen 7 3700U, no CUDA/bf16 hw accel):
+    # only ~196% CPU usage out of 8 threads available, vs near-full multi-thread
+    # utilization for fp32 matmul via MKL/oneDNN. This CPU's bf16 GEMM kernels
+    # aren't well-threaded - net ~4x slower wall-clock despite the memory win.
+    # Reverted; use --batch-size to manage memory instead (proven no-cost lever
+    # here: batch=2 and batch=4 measured near-identical per-token throughput).
+    print(f"Loaded {model.num_parameters() / 1e6:.1f}M-param checkpoint from {args.checkpoint}")
 
     def _doc_gen():
         for d in iter_documents(args.data, "voice"):
@@ -127,7 +131,7 @@ def main():
         weight_decay=0.1,
         adam_beta2=0.95,
         optim="adamw_torch",          # no bitsandbytes here - CPU only, no CUDA
-        logging_steps=10,
+        logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=args.keep_recent,
         report_to="none",
