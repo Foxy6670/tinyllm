@@ -1,3 +1,6 @@
+# DISCLAIMER
+ - Before attempting to use or modify this software in any way, shape or form, read the [`Acceptable Usage Policy`](AUP.md) for the usage disclaimer.
+
 # tinyllm
 
 A ~44M-param **Qwen3** micro language model, pretrained from a cold init and
